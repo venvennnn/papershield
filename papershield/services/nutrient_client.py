@@ -147,16 +147,28 @@ class LiveNutrientProvider(NutrientProvider):
         """
         Permanent redaction via Nutrient Processor API POST /build.
 
-        Builds a list of redaction annotation objects (pspdfkit/markup/redaction)
-        then applies them in a single /build call.
-
-        Bounds are in PDF-point space (origin bottom-left per PDF spec).
-        The Nutrient Processor API expects rects as [x, y, width, height] in
-        PDF points with y measured from the bottom of the page.
-        We receive bbox as [x1, y1, x2, y2] in PyMuPDF render-space (top-left origin).
-        Convert: pdf_y = page_height - y2; height = y2 - y1.
+        Falls back to PyMuPDF if the account does not have Processor API access
+        (e.g. a Data-Extraction-only hackathon key returns 403 on /build).
+        The fallback is clearly labeled in the provider_name.
         """
-        import fitz  # to read page heights for coordinate conversion
+        # Try Nutrient /build first
+        try:
+            return self._apply_redactions_nutrient(pdf_bytes, redaction_regions, filename)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                # Processor API not enabled for this key — fall back to PyMuPDF
+                self._processor_api_available = False
+                return _pymupdf_redact(pdf_bytes, redaction_regions)
+            raise
+
+    def _apply_redactions_nutrient(
+        self,
+        pdf_bytes: bytes,
+        redaction_regions: List[Dict[str, Any]],
+        filename: str,
+    ) -> bytes:
+        """Call Nutrient /build with coordinate-based redaction annotations."""
+        import fitz
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         page_heights = {i + 1: doc[i].rect.height for i in range(len(doc))}
         doc.close()
@@ -169,7 +181,7 @@ class LiveNutrientProvider(NutrientProvider):
                 continue
             x1, y1, x2, y2 = bbox
             ph = page_heights.get(page, 792.0)
-            # Convert from top-left origin to PDF bottom-left origin
+            # Convert top-left origin → PDF bottom-left origin
             pdf_y = ph - y2
             annotations.append({
                 "v": 1,
@@ -183,10 +195,7 @@ class LiveNutrientProvider(NutrientProvider):
         instructions = {
             "parts": [{"file": "document"}],
             "actions": [
-                {
-                    "type": "addRedactions",
-                    "redactions": annotations,
-                },
+                {"type": "addRedactions", "redactions": annotations},
                 {"type": "applyRedactions"},
             ],
         }
@@ -206,6 +215,8 @@ class LiveNutrientProvider(NutrientProvider):
 
     @property
     def provider_name(self) -> str:
+        if getattr(self, "_processor_api_available", True) is False:
+            return "LiveNutrient·Extract+LocalRedact"
         return "LiveNutrient"
 
 
@@ -340,6 +351,24 @@ def _extract_text(item: Dict[str, Any]) -> str:
         return " ".join(parts)
 
     return ""
+
+
+def _pymupdf_redact(pdf_bytes: bytes, redaction_regions: List[Dict[str, Any]]) -> bytes:
+    """Local permanent redaction via PyMuPDF (fallback when Processor API is unavailable)."""
+    import fitz
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    for region in redaction_regions:
+        page_num = region.get("page", 1) - 1
+        bbox = region.get("bbox")
+        if bbox and len(bbox) == 4 and 0 <= page_num < len(doc):
+            page = doc[page_num]
+            rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+            page.add_redact_annot(rect, fill=(0, 0, 0))
+    for page in doc:
+        page.apply_redactions()
+    result = doc.tobytes(garbage=4, deflate=True)
+    doc.close()
+    return result
 
 
 def _load_fixture_elements() -> List[DocumentElement]:
