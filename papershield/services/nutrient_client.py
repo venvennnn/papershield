@@ -1,18 +1,28 @@
 """
 Nutrient provider interface.
 
-LiveNutrientProvider: calls real Nutrient APIs.
-DemoNutrientProvider: returns fixture data for demo/testing.
+LiveNutrientProvider: calls the real Nutrient DWS APIs.
+  - Extraction:  POST https://api.nutrient.io/extraction/parse
+  - Redaction:   POST https://api.nutrient.io/build  (Processor API)
+  Authentication: Authorization: Bearer <pdf_live_...>
+
+DemoNutrientProvider: returns fixture data; shown when credentials are absent.
+
+Hackathon note
+--------------
+The campaign URL https://api.nutrient.io/campaigns/api-world-cloudx-ai-hackathon-2026/
+redirects to the Nutrient dashboard (dashboard.nutrient.io).
+Sign in there with the hackathon credentials to retrieve a pdf_live_... API key,
+then set NUTRIENT_API_KEY to that value and DEMO_MODE=false.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional, List, Dict, Any
-
-import io
+from typing import List, Dict, Any, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -25,16 +35,24 @@ NUTRIENT_API_KEY = os.environ.get("NUTRIENT_API_KEY", "")
 
 _DEMO_FIXTURE_PATH = Path(__file__).parent.parent / "fixtures" / "demo_extraction.json"
 
+# Extraction parse endpoint — returns spatial elements with bounding boxes
+_PARSE_ENDPOINT = "/extraction/parse"
+
+# Processor API build endpoint — for permanent redaction
+_BUILD_ENDPOINT = "/build"
+
 
 class NutrientProvider(ABC):
     """Abstract provider interface."""
 
     @abstractmethod
     def extract_document(self, pdf_bytes: bytes, filename: str = "document.pdf") -> List[DocumentElement]:
+        """Extract text and spatial elements from a PDF."""
         ...
 
     @abstractmethod
     def apply_ocr(self, pdf_bytes: bytes) -> List[DocumentElement]:
+        """Apply OCR to a scanned PDF and return elements."""
         ...
 
     @abstractmethod
@@ -44,10 +62,10 @@ class NutrientProvider(ABC):
         redaction_regions: List[Dict[str, Any]],
         filename: str = "document.pdf",
     ) -> bytes:
+        """Apply permanent redactions and return the sanitized PDF bytes."""
         ...
 
     def render_pages(self, pdf_bytes: bytes) -> List[bytes]:
-        """Optional: render each page to PNG bytes. Default: not implemented."""
         raise NotImplementedError
 
     @property
@@ -60,7 +78,13 @@ class NutrientProvider(ABC):
 
 
 class LiveNutrientProvider(NutrientProvider):
-    """Calls Nutrient Data Extraction and DWS Processor APIs."""
+    """
+    Calls Nutrient DWS APIs with a pdf_live_... API key.
+
+    Extraction uses POST /extraction/parse (Data Extraction API).
+    Redaction uses POST /build (Processor API).
+    Both use Bearer token authentication.
+    """
 
     def __init__(self, api_key: str = "", base_url: str = ""):
         self._api_key = api_key or NUTRIENT_API_KEY
@@ -69,32 +93,50 @@ class LiveNutrientProvider(NutrientProvider):
             raise ValueError("NUTRIENT_API_KEY is not configured.")
 
     def _headers(self) -> Dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._api_key}",
-        }
+        return {"Authorization": f"Bearer {self._api_key}"}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=16))
     def extract_document(self, pdf_bytes: bytes, filename: str = "document.pdf") -> List[DocumentElement]:
-        """Use Nutrient Data Extraction API to extract text with coordinates."""
-        url = f"{self._base_url}/v1/extract"
-        files = {"file": (filename, pdf_bytes, "application/pdf")}
-        data = {"output_formats": "json", "extract_coordinates": "true"}
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(url, headers=self._headers(), files=files, data=data)
+        """
+        POST /extraction/parse with mode=structure (fast OCR + spatial elements).
+        Uses structure mode to get bounding boxes without consuming understand credits
+        for every page during inspection.
+        """
+        url = f"{self._base_url}{_PARSE_ENDPOINT}"
+        instructions = json.dumps({
+            "mode": "structure",
+            "output": {"format": "spatial"},
+        })
+        with httpx.Client(timeout=90.0) as client:
+            resp = client.post(
+                url,
+                headers=self._headers(),
+                files={"file": (filename, pdf_bytes, "application/pdf")},
+                data={"instructions": instructions},
+            )
             resp.raise_for_status()
-        return _parse_nutrient_extraction(resp.json())
+        return _parse_extraction_response(resp.json())
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=16))
     def apply_ocr(self, pdf_bytes: bytes) -> List[DocumentElement]:
-        """Apply OCR via Nutrient processing endpoint and extract text."""
-        url = f"{self._base_url}/v1/process"
-        files = {"file": ("document.pdf", pdf_bytes, "application/pdf")}
-        data = {"operations": json.dumps({"ocr": {}})}
+        """
+        POST /extraction/parse with mode=structure — structure mode runs OCR internally.
+        We request a second pass with includeWords to get word-level text for comparison.
+        """
+        url = f"{self._base_url}{_PARSE_ENDPOINT}"
+        instructions = json.dumps({
+            "mode": "structure",
+            "output": {"format": "spatial", "includeWords": True},
+        })
         with httpx.Client(timeout=120.0) as client:
-            resp = client.post(url, headers=self._headers(), files=files, data=data)
+            resp = client.post(
+                url,
+                headers=self._headers(),
+                files={"file": ("document.pdf", pdf_bytes, "application/pdf")},
+                data={"instructions": instructions},
+            )
             resp.raise_for_status()
-        ocr_pdf = resp.content
-        return self.extract_document(ocr_pdf, "ocr_result.pdf")
+        return _parse_extraction_response(resp.json())
 
     def apply_redactions(
         self,
@@ -102,32 +144,63 @@ class LiveNutrientProvider(NutrientProvider):
         redaction_regions: List[Dict[str, Any]],
         filename: str = "document.pdf",
     ) -> bytes:
-        """Apply permanent redactions via Nutrient DWS Processor API."""
-        # Build redaction annotation objects per Nutrient spec
+        """
+        Permanent redaction via Nutrient Processor API POST /build.
+
+        Builds a list of redaction annotation objects (pspdfkit/markup/redaction)
+        then applies them in a single /build call.
+
+        Bounds are in PDF-point space (origin bottom-left per PDF spec).
+        The Nutrient Processor API expects rects as [x, y, width, height] in
+        PDF points with y measured from the bottom of the page.
+        We receive bbox as [x1, y1, x2, y2] in PyMuPDF render-space (top-left origin).
+        Convert: pdf_y = page_height - y2; height = y2 - y1.
+        """
+        import fitz  # to read page heights for coordinate conversion
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_heights = {i + 1: doc[i].rect.height for i in range(len(doc))}
+        doc.close()
+
         annotations = []
         for region in redaction_regions:
             page = region.get("page", 1)
-            bbox = region.get("bbox", [0, 0, 100, 20])
+            bbox = region.get("bbox")
+            if not bbox or len(bbox) != 4:
+                continue
+            x1, y1, x2, y2 = bbox
+            ph = page_heights.get(page, 792.0)
+            # Convert from top-left origin to PDF bottom-left origin
+            pdf_y = ph - y2
             annotations.append({
+                "v": 1,
                 "type": "pspdfkit/markup/redaction",
                 "pageIndex": page - 1,
-                "rects": [[bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]]],
+                "rects": [[x1, pdf_y, x2 - x1, y2 - y1]],
                 "fillColor": "#000000",
+                "overlayText": "",
             })
 
-        operations = [
-            {"type": "addRedactions", "annotations": annotations},
-            {"type": "applyRedactions"},
-        ]
-        payload = json.dumps({"parts": [{"file": "file"}], "operations": operations})
-
-        url = f"{self._base_url}/v1/process"
-        files = {
-            "file": (filename, pdf_bytes, "application/pdf"),
-            "instructions": (None, payload, "application/json"),
+        instructions = {
+            "parts": [{"file": "document"}],
+            "actions": [
+                {
+                    "type": "addRedactions",
+                    "redactions": annotations,
+                },
+                {"type": "applyRedactions"},
+            ],
         }
+
+        url = f"{self._base_url}{_BUILD_ENDPOINT}"
         with httpx.Client(timeout=120.0) as client:
-            resp = client.post(url, headers=self._headers(), files=files)
+            resp = client.post(
+                url,
+                headers=self._headers(),
+                files={
+                    "document": (filename, pdf_bytes, "application/pdf"),
+                    "instructions": (None, json.dumps(instructions), "application/json"),
+                },
+            )
             resp.raise_for_status()
         return resp.content
 
@@ -137,12 +210,17 @@ class LiveNutrientProvider(NutrientProvider):
 
 
 class DemoNutrientProvider(NutrientProvider):
-    """Returns fixture data; used when credentials are absent or DEMO_MODE=true."""
+    """
+    Returns fixture data when Nutrient credentials are absent or DEMO_MODE=true.
+    Redaction is applied locally via PyMuPDF.
+    Shows 'Prepared demo' badge in the UI.
+    """
 
     def extract_document(self, pdf_bytes: bytes, filename: str = "document.pdf") -> List[DocumentElement]:
         return _load_fixture_elements()
 
     def apply_ocr(self, pdf_bytes: bytes) -> List[DocumentElement]:
+        # In demo mode, OCR returns same elements (digital extraction is already done)
         return _load_fixture_elements()
 
     def apply_redactions(
@@ -151,14 +229,14 @@ class DemoNutrientProvider(NutrientProvider):
         redaction_regions: List[Dict[str, Any]],
         filename: str = "document.pdf",
     ) -> bytes:
-        """Demo redaction: use PyMuPDF to apply visual redactions locally."""
+        """Demo redaction via PyMuPDF — permanent within the copy."""
         try:
-            import fitz  # PyMuPDF
+            import fitz
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
             for region in redaction_regions:
                 page_num = region.get("page", 1) - 1
                 bbox = region.get("bbox")
-                if bbox and 0 <= page_num < len(doc):
+                if bbox and len(bbox) == 4 and 0 <= page_num < len(doc):
                     page = doc[page_num]
                     rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
                     page.add_redact_annot(rect, fill=(0, 0, 0))
@@ -174,7 +252,7 @@ class DemoNutrientProvider(NutrientProvider):
 
 
 def get_provider() -> NutrientProvider:
-    """Return the appropriate provider based on environment."""
+    """Return the appropriate provider based on environment configuration."""
     demo_mode = os.environ.get("DEMO_MODE", "true").lower() in ("1", "true", "yes")
     api_key = os.environ.get("NUTRIENT_API_KEY", "")
     if demo_mode or not api_key:
@@ -182,40 +260,90 @@ def get_provider() -> NutrientProvider:
     return LiveNutrientProvider(api_key=api_key)
 
 
-def _parse_nutrient_extraction(payload: Dict[str, Any]) -> List[DocumentElement]:
-    """Normalize Nutrient extraction API response into DocumentElements."""
+# ---------------------------------------------------------------------------
+# Response normalizers
+# ---------------------------------------------------------------------------
+
+def _parse_extraction_response(payload: Dict[str, Any]) -> List[DocumentElement]:
+    """
+    Normalize the Nutrient /extraction/parse spatial response.
+
+    Response schema:
+      payload["output"]["elements"][i]:
+        {
+          "type": "paragraph" | "table" | ...,
+          "text": "...",
+          "confidence": 0.95,
+          "readingOrder": 0,
+          "bounds": { "x": 100, "y": 50, "width": 400, "height": 35 },
+          "page": { "pageIndex": 0, "pageNumber": 1, "width": 1818, "height": 2422 }
+        }
+
+    bounds origin: top-left, in render-space pixels.
+    We store as BoundingBox(x1, y1, x2, y2) in the same coordinate space.
+    """
     elements: List[DocumentElement] = []
-    pages = payload.get("pages", payload.get("data", {}).get("pages", []))
-    for page_data in pages:
-        page_num = page_data.get("pageNumber", page_data.get("index", 0)) + 1
-        for block in page_data.get("textBlocks", page_data.get("blocks", [])):
-            text = block.get("text", "").strip()
-            if not text:
-                continue
-            raw_bbox = block.get("boundingBox", block.get("bbox"))
-            bbox = None
-            if raw_bbox:
-                if isinstance(raw_bbox, dict):
-                    bbox = BoundingBox(
-                        x1=raw_bbox.get("left", raw_bbox.get("x1", 0)),
-                        y1=raw_bbox.get("top", raw_bbox.get("y1", 0)),
-                        x2=raw_bbox.get("right", raw_bbox.get("x2", 100)),
-                        y2=raw_bbox.get("bottom", raw_bbox.get("y2", 20)),
-                    )
-                elif isinstance(raw_bbox, list) and len(raw_bbox) == 4:
-                    bbox = BoundingBox(x1=raw_bbox[0], y1=raw_bbox[1], x2=raw_bbox[2], y2=raw_bbox[3])
-            elements.append(DocumentElement(
-                page=page_num,
-                text=text,
-                bbox=bbox,
-                confidence=block.get("confidence"),
-                source="digital",
-            ))
+    raw_elements = payload.get("output", {}).get("elements", [])
+
+    for item in raw_elements:
+        text = _extract_text(item)
+        if not text:
+            continue
+
+        page_info = item.get("page", {})
+        page_num = page_info.get("pageNumber", 1)
+
+        bounds = item.get("bounds")
+        bbox = None
+        if bounds:
+            x = bounds.get("x", 0)
+            y = bounds.get("y", 0)
+            w = bounds.get("width", 0)
+            h = bounds.get("height", 0)
+            bbox = BoundingBox(x1=x, y1=y, x2=x + w, y2=y + h)
+
+        elements.append(DocumentElement(
+            page=page_num,
+            text=text,
+            bbox=bbox,
+            confidence=item.get("confidence"),
+            source="digital",
+            reading_order=item.get("readingOrder"),
+        ))
+
     return elements
 
 
+def _extract_text(item: Dict[str, Any]) -> str:
+    """Extract text from an element, handling paragraphs, tables, etc."""
+    # Paragraph / handwriting / formula
+    if "text" in item:
+        return item["text"].strip()
+
+    # Table: concatenate cell text
+    if item.get("type") == "table":
+        parts = []
+        for cell in item.get("cells", []):
+            cell_text = cell.get("text", "").strip()
+            if cell_text:
+                parts.append(cell_text)
+        return " ".join(parts)
+
+    # Key-value region
+    if item.get("type") == "keyValueRegion":
+        parts = []
+        for pair in item.get("pairs", []):
+            k = pair.get("key", {}).get("text", "")
+            v = pair.get("value", {}).get("text", "")
+            if k or v:
+                parts.append(f"{k}: {v}".strip(": "))
+        return " ".join(parts)
+
+    return ""
+
+
 def _load_fixture_elements() -> List[DocumentElement]:
-    """Load demo extraction fixture."""
+    """Load demo extraction fixture from disk."""
     if _DEMO_FIXTURE_PATH.exists():
         data = json.loads(_DEMO_FIXTURE_PATH.read_text())
         return [DocumentElement(**e) for e in data]
